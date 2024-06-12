@@ -13,7 +13,7 @@ use super::lwip::*;
 #[allow(unused_variables)]
 pub unsafe extern "C" fn udp_recv_cb(
     arg: *mut raw::c_void,
-    _pcb: *mut udp_pcb,
+    pcb: *mut udp_pcb,
     p: *mut pbuf,
     addr: *const ip_addr_t,
     port: u16_t,
@@ -126,6 +126,12 @@ fn new0() -> io::Result<(UdpSocketWrite, UdpSocketRead)> {
     let _g = LWIP_MUTEX.lock();
     unsafe {
         let udp_pcb = udp_new();
+        if udp_pcb.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "udp_new failed: is_null",
+            ));
+        }
         let err = udp_bind(udp_pcb, &ip_addr_any_type, 0);
         if err != err_enum_t_ERR_OK as err_t {
             return Err(io::Error::new(
@@ -165,6 +171,7 @@ impl Drop for UdpSocketWriteInner {
         let _g = LWIP_MUTEX.lock();
         unsafe {
             udp_recv(self.udp_pcb, None, std::ptr::null_mut());
+            udp_disconnect(self.udp_pcb);
             udp_remove(self.udp_pcb);
             drop(Box::from_raw(self.arg));
         }

@@ -1,7 +1,7 @@
 use crate::lwip::{
-    err_enum_t_ERR_CONN, err_enum_t_ERR_OK, err_t, pbuf, pbuf_copy_partial, pbuf_free, tcp_abort,
-    tcp_arg, tcp_bind, tcp_connect, tcp_err, tcp_new, tcp_output, tcp_pcb, tcp_poll, tcp_recv,
-    tcp_sent, tcp_shutdown, tcp_write, u16_t, SOF_KEEPALIVE, TCP_WRITE_FLAG_COPY, TF_NODELAY,
+    err_enum_t_ERR_OK, err_t, pbuf, pbuf_copy_partial, pbuf_free, tcp_abort, tcp_arg, tcp_bind,
+    tcp_connect, tcp_err, tcp_new, tcp_output, tcp_pcb, tcp_poll, tcp_recv, tcp_recved, tcp_sent,
+    tcp_shutdown, tcp_write, u16_t, SOF_KEEPALIVE, TCP_WRITE_FLAG_COPY, TF_NODELAY,
 };
 use crate::{util, LWIP_MUTEX};
 use std::io;
@@ -16,7 +16,7 @@ use tokio::sync::watch;
 unsafe extern "C" fn tcp_connect_cb(arg: *mut raw::c_void, pcb: *mut tcp_pcb, err: err_t) -> err_t {
     if arg.is_null() {
         log::warn!("tcp_connect_cb tcp connection has been closed");
-        return err_enum_t_ERR_CONN as err_t;
+        return err_enum_t_ERR_OK as err_t;
     }
     if err == err_enum_t_ERR_OK as _ {
         let arg = arg as *mut TcpArgs;
@@ -31,22 +31,22 @@ unsafe extern "C" fn tcp_connect_cb(arg: *mut raw::c_void, pcb: *mut tcp_pcb, er
 #[allow(unused_variables)]
 pub unsafe extern "C" fn tcp_recv_cb(
     arg: *mut raw::c_void,
-    tpcb: *mut tcp_pcb,
+    t_pcb: *mut tcp_pcb,
     p: *mut pbuf,
     err: err_t,
 ) -> err_t {
     if arg.is_null() {
         log::warn!("tcp_recv_cb arg.is_null()");
-        return err_enum_t_ERR_CONN as err_t;
+        return err_enum_t_ERR_OK as err_t;
     }
     let arg = arg as *mut TcpArgs;
-    if p.is_null() || err != err_enum_t_ERR_OK as _ {
+    if p.is_null() {
         log::info!("tcp_recv_cb p.is_null ");
         let _ = (&*arg).state_sender.send(CLOSE);
         if let Err(_) = (&*arg).buf_sender.try_send(vec![]) {
             log::warn!("ip mapping packet loss")
         }
-        return err_enum_t_ERR_CONN as err_t;
+        return err_enum_t_ERR_OK as err_t;
     }
 
     let pbuflen = std::ptr::read_unaligned(p).tot_len;
@@ -59,6 +59,7 @@ pub unsafe extern "C" fn tcp_recv_cb(
     }
 
     pbuf_free(p);
+    tcp_recved(t_pcb, pbuflen);
     err_enum_t_ERR_OK as err_t
 }
 
@@ -162,6 +163,7 @@ impl TcpStream {
             tcp_err(pcb, Some(tcp_err_cb));
             tcp_recv(pcb, Some(tcp_recv_cb));
             let mut pcb_v = std::ptr::read_unaligned(pcb as *const tcp_pcb);
+            pcb_v.snd_buf = 65535;
             pcb_v.so_options |= SOF_KEEPALIVE as u8;
             pcb_v.flags |= TF_NODELAY as u16;
             std::ptr::write_unaligned(pcb, pcb_v);
@@ -178,6 +180,12 @@ impl TcpStream {
         let (write, read) = unsafe {
             let _g = LWIP_MUTEX.lock();
             let pcb = tcp_new();
+            if pcb.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "tcp_new failed: is_null",
+                ));
+            }
             let err = tcp_bind(pcb, &util::to_ip_addr_t(src_addr.ip()), src_addr.port());
             if err != err_enum_t_ERR_OK as err_t {
                 return Err(io::Error::new(
@@ -214,6 +222,7 @@ impl TcpStream {
 
             tcp_recv(pcb, Some(tcp_recv_cb));
             let mut pcb_v = std::ptr::read_unaligned(pcb as *const tcp_pcb);
+            pcb_v.snd_buf = 65535;
             pcb_v.so_options |= SOF_KEEPALIVE as u8;
             pcb_v.flags |= TF_NODELAY as u16;
             std::ptr::write_unaligned(pcb, pcb_v);
