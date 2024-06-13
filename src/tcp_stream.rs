@@ -1,14 +1,19 @@
 use crate::lwip::{
-    err_enum_t_ERR_OK, err_t, pbuf, pbuf_copy_partial, pbuf_free, tcp_abort, tcp_arg, tcp_bind,
-    tcp_connect, tcp_err, tcp_new, tcp_output, tcp_pcb, tcp_poll, tcp_recv, tcp_recved, tcp_sent,
-    tcp_shutdown, tcp_write, u16_t, SOF_KEEPALIVE, TCP_WRITE_FLAG_COPY, TF_NODELAY,
+    err_enum_t_ERR_MEM, err_enum_t_ERR_OK, err_t, pbuf, pbuf_copy_partial, pbuf_free, tcp_arg,
+    tcp_bind, tcp_connect, tcp_err, tcp_new, tcp_output, tcp_pcb, tcp_poll, tcp_recv, tcp_recved,
+    tcp_sent, tcp_shutdown, tcp_write, u16_t, SOF_KEEPALIVE, TCP_WRITE_FLAG_COPY, TF_NODELAY,
 };
 use crate::{util, LWIP_MUTEX};
 use std::io;
+use std::io::Error;
 use std::net::SocketAddr;
 use std::os::raw;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
 
@@ -42,36 +47,63 @@ pub unsafe extern "C" fn tcp_recv_cb(
     let arg = arg as *mut TcpArgs;
     if p.is_null() {
         log::info!("tcp_recv_cb p.is_null ");
-        let _ = (&*arg).state_sender.send(CLOSE);
-        if let Err(_) = (&*arg).buf_sender.try_send(vec![]) {
-            log::warn!("ip mapping packet loss")
-        }
+        (&*arg).close_read();
         return err_enum_t_ERR_OK as err_t;
     }
 
-    let pbuflen = std::ptr::read_unaligned(p).tot_len;
-    let mut buf = Vec::with_capacity(pbuflen as usize);
-    pbuf_copy_partial(p, buf.as_mut_ptr() as _, pbuflen, 0);
-    buf.set_len(pbuflen as usize);
-
-    if let Err(_) = (&*arg).buf_sender.try_send(buf) {
-        log::warn!("ip mapping packet loss")
+    if let Err(e) = (&*arg).buf_sender.try_send(ReadItem::new(t_pcb, p)) {
+        match e {
+            TrySendError::Full(read_item) => {
+                //不回收数据
+                read_item.back();
+                log::warn!("tcp read busy")
+            }
+            TrySendError::Closed(_) => {
+                log::warn!("tcp close")
+            }
+        }
     }
+    err_enum_t_ERR_OK as err_t
+}
 
-    pbuf_free(p);
-    tcp_recved(t_pcb, pbuflen);
+#[allow(unused_variables)]
+pub unsafe extern "C" fn tcp_sent_cb(
+    arg: *mut raw::c_void,
+    tpcb: *mut tcp_pcb,
+    len: u16_t,
+) -> err_t {
+    if arg.is_null() {
+        log::warn!("tcp_sent_cb arg.is_null()");
+        return err_enum_t_ERR_OK as err_t;
+    }
+    let arg = arg as *mut TcpArgs;
+    if let Some(w) = (*arg).notify.take() {
+        w.wake()
+    }
+    err_enum_t_ERR_OK as err_t
+}
+
+#[allow(unused_variables)]
+pub unsafe extern "C" fn tcp_poll_cb(arg: *mut raw::c_void, tpcb: *mut tcp_pcb) -> err_t {
+    if arg.is_null() {
+        log::warn!("tcp_sent_cb arg.is_null()");
+        return err_enum_t_ERR_OK as err_t;
+    }
+    let arg = arg as *mut TcpArgs;
+    if let Some(w) = (*arg).notify.take() {
+        w.wake()
+    }
     err_enum_t_ERR_OK as err_t
 }
 
 #[allow(unused_variables)]
 pub unsafe extern "C" fn tcp_err_cb(arg: *mut raw::c_void, err: err_t) {
+    log::warn!("tcp_err_cb tcp connection has been closed");
     if arg.is_null() {
-        log::warn!("tcp_err_cb tcp connection has been closed");
         return;
     }
     let arg = arg as *mut TcpArgs;
-    let _ = (&*arg).state_sender.send(CLOSE);
-    let _ = (&*arg).buf_sender.send(vec![]);
+    (&*arg).close();
 }
 
 pub struct TcpStream {
@@ -115,7 +147,9 @@ impl Drop for TcpContext {
             tcp_sent(self.pcb, None);
             tcp_err(self.pcb, None);
             tcp_poll(self.pcb, None, 0);
-            tcp_abort(self.pcb);
+            // if tcp_close(self.pcb) != err_enum_t_ERR_OK as _ {
+            //     tcp_abort(self.pcb);
+            // }
             let _ = Box::from_raw(self.tcp_args);
         }
     }
@@ -128,21 +162,117 @@ impl TcpContext {
 }
 
 pub struct TcpArgs {
-    buf_sender: Sender<Vec<u8>>,
+    buf_sender: Sender<ReadItem>,
     state_sender: watch::Sender<usize>,
+    notify: Option<Waker>,
+}
+
+impl TcpArgs {
+    pub fn close(&self) {
+        let _ = self.state_sender.send(CLOSE);
+        let _ = self.buf_sender.try_send(ReadItem::new_null());
+    }
+    pub fn close_read(&self) {
+        let _ = self.buf_sender.try_send(ReadItem::new_null());
+    }
 }
 
 const SYN_SENT: usize = 0;
 const ESTABLISHED: usize = 1;
 const CLOSE: usize = 2;
 
+pub struct ReadItem {
+    t_pcb: *mut tcp_pcb,
+    p: *mut pbuf,
+    offset: usize,
+}
+
+impl ReadItem {
+    pub fn new_null() -> Self {
+        Self {
+            t_pcb: std::ptr::null_mut(),
+            p: std::ptr::null_mut(),
+            offset: 0,
+        }
+    }
+    pub fn new(t_pcb: *mut tcp_pcb, p: *mut pbuf) -> Self {
+        Self {
+            t_pcb,
+            p,
+            offset: 0,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        if self.p.is_null() {
+            return true;
+        }
+        unsafe {
+            let pbuflen = std::ptr::read_unaligned(self.p).tot_len;
+            pbuflen == self.offset as _
+        }
+    }
+    pub fn len(&self) -> usize {
+        if self.p.is_null() {
+            return 0;
+        }
+        unsafe {
+            let pbuflen = std::ptr::read_unaligned(self.p).tot_len as usize;
+            pbuflen - self.offset
+        }
+    }
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        unsafe {
+            let len = std::ptr::read_unaligned(self.p).tot_len as usize - self.offset;
+            let pbuflen = buf.len().min(len);
+            if pbuflen == 0 {
+                return 0;
+            }
+            pbuf_copy_partial(
+                self.p,
+                buf.as_mut_ptr() as _,
+                pbuflen as _,
+                self.offset as _,
+            );
+            self.offset += pbuflen;
+            pbuflen
+        }
+    }
+    pub fn recved(mut self) {
+        unsafe {
+            pbuf_free(self.p);
+            let pbuflen = std::ptr::read_unaligned(self.p).tot_len;
+            tcp_recved(self.t_pcb, pbuflen);
+            self.p = std::ptr::null_mut();
+        }
+    }
+    pub fn back(mut self) {
+        self.p = std::ptr::null_mut();
+        self.t_pcb = std::ptr::null_mut();
+    }
+}
+
+impl Drop for ReadItem {
+    fn drop(&mut self) {
+        if !self.p.is_null() {
+            let _g = LWIP_MUTEX.lock();
+            unsafe {
+                pbuf_free(self.p);
+            }
+        }
+    }
+}
+
+unsafe impl Send for ReadItem {}
+
 impl TcpStream {
     pub(crate) fn new(pcb: *mut tcp_pcb) -> TcpStream {
+        let _g = LWIP_MUTEX.lock();
         let (state_sender, _state_receiver) = watch::channel(ESTABLISHED);
         let (buf_sender, buf_receiver) = channel(1024);
         let tcp_args = Box::into_raw(Box::new(TcpArgs {
             buf_sender,
             state_sender,
+            notify: None,
         }));
         unsafe {
             let pcb_v = std::ptr::read_unaligned(pcb);
@@ -157,11 +287,14 @@ impl TcpStream {
             let read = TcpStreamRead {
                 receiver: buf_receiver,
                 tcp_context,
+                last: None,
             };
 
             tcp_arg(pcb, tcp_args as *mut raw::c_void);
             tcp_err(pcb, Some(tcp_err_cb));
             tcp_recv(pcb, Some(tcp_recv_cb));
+            tcp_sent(pcb, Some(tcp_sent_cb));
+            // tcp_poll(pcb, Some(tcp_poll_cb), 8 as _);
             let mut pcb_v = std::ptr::read_unaligned(pcb as *const tcp_pcb);
             pcb_v.snd_buf = 65535;
             pcb_v.so_options |= SOF_KEEPALIVE as u8;
@@ -171,7 +304,7 @@ impl TcpStream {
         }
     }
     pub async fn connect(
-        src_addr: SocketAddr,
+        mut src_addr: SocketAddr,
         dest_addr: SocketAddr,
         time: Duration,
     ) -> io::Result<TcpStream> {
@@ -181,22 +314,24 @@ impl TcpStream {
             let _g = LWIP_MUTEX.lock();
             let pcb = tcp_new();
             if pcb.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "tcp_new failed: is_null",
-                ));
+                return Err(Error::new(io::ErrorKind::Other, "tcp_new failed: is_null"));
             }
             let err = tcp_bind(pcb, &util::to_ip_addr_t(src_addr.ip()), src_addr.port());
             if err != err_enum_t_ERR_OK as err_t {
-                return Err(io::Error::new(
+                return Err(Error::new(
                     io::ErrorKind::Other,
                     format!("bind TCP failed: {} {}", src_addr, err),
                 ));
+            }
+            {
+                let pcb_v = std::ptr::read_unaligned(pcb);
+                src_addr = util::to_socket_addr(&pcb_v.local_ip, pcb_v.local_port);
             }
             let (buf_sender, buf_receiver) = channel(1024);
             let tcp_args = Box::into_raw(Box::new(TcpArgs {
                 buf_sender,
                 state_sender,
+                notify: None,
             }));
             let tcp_context = Arc::new(TcpContext { pcb, tcp_args });
             let write = TcpStreamWrite {
@@ -207,6 +342,7 @@ impl TcpStream {
             let read = TcpStreamRead {
                 receiver: buf_receiver,
                 tcp_context,
+                last: None,
             };
 
             tcp_arg(pcb, tcp_args as *mut raw::c_void);
@@ -221,6 +357,9 @@ impl TcpStream {
             }
 
             tcp_recv(pcb, Some(tcp_recv_cb));
+            tcp_sent(pcb, Some(tcp_sent_cb));
+            // tcp_poll(pcb, Some(tcp_poll_cb), 8 as _);
+
             let mut pcb_v = std::ptr::read_unaligned(pcb as *const tcp_pcb);
             pcb_v.snd_buf = 65535;
             pcb_v.so_options |= SOF_KEEPALIVE as u8;
@@ -232,14 +371,14 @@ impl TcpStream {
         match tokio::time::timeout(time, state_receiver.changed()).await {
             Ok(rs) => {
                 if rs.is_err() || *state_receiver.borrow() == CLOSE {
-                    return Err(io::Error::new(
+                    return Err(Error::new(
                         io::ErrorKind::ConnectionRefused,
                         "ConnectionRefused",
                     ));
                 }
             }
             Err(_) => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "TimedOut"));
+                return Err(Error::new(io::ErrorKind::TimedOut, "TimedOut"));
             }
         }
 
@@ -257,21 +396,49 @@ impl TcpStream {
 }
 
 pub struct TcpStreamRead {
-    receiver: Receiver<Vec<u8>>,
+    receiver: Receiver<ReadItem>,
     tcp_context: Arc<TcpContext>,
+    last: Option<ReadItem>,
 }
 
-impl TcpStreamRead {
-    pub async fn read(&mut self) -> io::Result<Vec<u8>> {
+impl AsyncRead for TcpStreamRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut ReadBuf,
+    ) -> Poll<io::Result<()>> {
+        let _guard = LWIP_MUTEX.lock();
         if self.tcp_context.is_close() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"));
+            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
         }
-        if let Some(buf) = self.receiver.recv().await {
-            if !buf.is_empty() {
-                return Ok(buf);
+        if let Some(last) = &mut self.last {
+            buf.advance(buf.remaining().min(last.len()));
+            last.read(buf.filled_mut());
+            if last.is_empty() {
+                if let Some(last) = self.last.take() {
+                    last.recved();
+                }
             }
+            return Poll::Ready(Ok(()));
         }
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"))
+        return match Pin::new(&mut self.receiver).poll_recv(cx) {
+            Poll::Ready(read_item) => {
+                if let Some(mut read_item) = read_item {
+                    if !read_item.is_empty() {
+                        buf.advance(buf.remaining().min(read_item.len()));
+                        read_item.read(buf.filled_mut());
+                        if !read_item.is_empty() {
+                            self.last.replace(read_item);
+                        } else {
+                            read_item.recved();
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")))
+            }
+            Poll::Pending => Poll::Pending,
+        };
     }
 }
 
@@ -288,14 +455,29 @@ impl TcpStreamWrite {
     pub fn dest_addr(&self) -> SocketAddr {
         self.dest_addr
     }
-    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn send_buf_size(&self) -> usize {
+        unsafe { std::ptr::read_volatile(self.tcp_context.pcb as *const tcp_pcb).snd_buf as usize }
+    }
+}
+
+impl tokio::io::AsyncWrite for TcpStreamWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        let _guard = LWIP_MUTEX.lock();
         if self.tcp_context.is_close() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "close"));
+            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
         }
-        let _g = LWIP_MUTEX.lock();
         let to_write = buf.len().min(self.send_buf_size());
         if to_write == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, ""));
+            unsafe {
+                (*self.tcp_context.tcp_args)
+                    .notify
+                    .replace(cx.waker().clone());
+            }
+            return Poll::Pending;
         }
         let err = unsafe {
             tcp_write(
@@ -306,38 +488,57 @@ impl TcpStreamWrite {
             )
         };
         if err == err_enum_t_ERR_OK as err_t {
+            // Call output in case of mem err?
             let err = unsafe { tcp_output(self.tcp_context.pcb) };
             if err == err_enum_t_ERR_OK as err_t {
-                Ok(to_write)
+                Poll::Ready(Ok(to_write))
             } else {
-                Err(io::Error::new(
+                Poll::Ready(Err(Error::new(
                     io::ErrorKind::Interrupted,
                     format!("netstack tcp_output error {}", err),
-                ))
+                )))
             }
+        } else if err == err_enum_t_ERR_MEM as err_t {
+            unsafe {
+                (*self.tcp_context.tcp_args)
+                    .notify
+                    .replace(cx.waker().clone());
+            }
+            Poll::Pending
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Poll::Ready(Err(Error::new(
+                io::ErrorKind::Interrupted,
                 format!("netstack tcp_write error {}", err),
-            ))
+            )))
         }
     }
-    pub async fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
-        loop {
-            let len = self.write(buf)?;
-            if len == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, ""));
-            }
-            buf = &buf[len..];
-            if buf.is_empty() {
-                return Ok(());
-            } else {
-                //先等待再说
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let _guard = LWIP_MUTEX.lock();
+        if self.tcp_context.is_close() {
+            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
+        }
+        let err = unsafe { tcp_output(self.tcp_context.pcb) };
+        if err != err_enum_t_ERR_OK as err_t {
+            Poll::Ready(Err(Error::new(
+                io::ErrorKind::Interrupted,
+                format!("netstack tcp_output error {}", err),
+            )))
+        } else {
+            Poll::Ready(Ok(()))
         }
     }
-    fn send_buf_size(&self) -> usize {
-        unsafe { std::ptr::read_unaligned(self.tcp_context.pcb as *const tcp_pcb).snd_buf as usize }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let _guard = LWIP_MUTEX.lock();
+        let err = unsafe { tcp_shutdown(self.tcp_context.pcb, 0, 1) };
+        if err != err_enum_t_ERR_OK as err_t {
+            Poll::Ready(Err(Error::new(
+                io::ErrorKind::Interrupted,
+                format!("netstack tcp_shutdown tx error {}", err),
+            )))
+        } else {
+            Poll::Ready(Ok(()))
+        }
     }
 }
