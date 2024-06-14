@@ -266,7 +266,6 @@ unsafe impl Send for ReadItem {}
 
 impl TcpStream {
     pub(crate) fn new(pcb: *mut tcp_pcb) -> TcpStream {
-        let _g = LWIP_MUTEX.lock();
         let (state_sender, _state_receiver) = watch::channel(ESTABLISHED);
         let (buf_sender, buf_receiver) = channel(1024);
         let tcp_args = Box::into_raw(Box::new(TcpArgs {
@@ -409,7 +408,7 @@ impl AsyncRead for TcpStreamRead {
     ) -> Poll<io::Result<()>> {
         let _guard = LWIP_MUTEX.lock();
         if self.tcp_context.is_close() {
-            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
+            return Poll::Ready(Err(Error::new(io::ErrorKind::NotConnected, "close")));
         }
         if let Some(last) = &mut self.last {
             buf.advance(buf.remaining().min(last.len()));
@@ -427,10 +426,10 @@ impl AsyncRead for TcpStreamRead {
                     if !read_item.is_empty() {
                         buf.advance(buf.remaining().min(read_item.len()));
                         read_item.read(buf.filled_mut());
-                        if !read_item.is_empty() {
-                            self.last.replace(read_item);
-                        } else {
+                        if read_item.is_empty() {
                             read_item.recved();
+                        } else {
+                            self.last.replace(read_item);
                         }
                         return Poll::Ready(Ok(()));
                     }
@@ -468,7 +467,7 @@ impl tokio::io::AsyncWrite for TcpStreamWrite {
     ) -> Poll<Result<usize, Error>> {
         let _guard = LWIP_MUTEX.lock();
         if self.tcp_context.is_close() {
-            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
+            return Poll::Ready(Err(Error::new(io::ErrorKind::NotConnected, "close")));
         }
         let to_write = buf.len().min(self.send_buf_size());
         if to_write == 0 {
@@ -516,7 +515,7 @@ impl tokio::io::AsyncWrite for TcpStreamWrite {
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let _guard = LWIP_MUTEX.lock();
         if self.tcp_context.is_close() {
-            return Poll::Ready(Err(Error::new(io::ErrorKind::UnexpectedEof, "close")));
+            return Poll::Ready(Err(Error::new(io::ErrorKind::NotConnected, "close")));
         }
         let err = unsafe { tcp_output(self.tcp_context.pcb) };
         if err != err_enum_t_ERR_OK as err_t {
@@ -531,6 +530,9 @@ impl tokio::io::AsyncWrite for TcpStreamWrite {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let _guard = LWIP_MUTEX.lock();
+        if self.tcp_context.is_close() {
+            return Poll::Ready(Err(Error::new(io::ErrorKind::NotConnected, "close")));
+        }
         let err = unsafe { tcp_shutdown(self.tcp_context.pcb, 0, 1) };
         if err != err_enum_t_ERR_OK as err_t {
             Poll::Ready(Err(Error::new(
