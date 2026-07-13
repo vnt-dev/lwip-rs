@@ -64,7 +64,7 @@ pub struct NetStackRead {
 impl Drop for NetStackRead {
     fn drop(&mut self) {
         let _ = NET_STACK_WRITE.lock().take();
-        self.handle.abort_handle();
+        self.handle.abort();
     }
 }
 
