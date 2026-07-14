@@ -5,7 +5,7 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-bindgen = "0.69.4"
+bindgen = "0.72.1"
 log = "0.4.21"
 parking_lot = "0.12.1"
 
@@ -14,5 +14,5 @@ crossbeam = "0.8.4"
 tokio = { version = "1.37.0", features = ["full"] }
 
 [build-dependencies]
-bindgen = "0.69.4"
+bindgen = "0.72.1"
 cc = "1.0.98"
